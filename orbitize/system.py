@@ -1,7 +1,11 @@
 import numpy as np
 from orbitize import nbody, kepler, basis, hipparcos
 from astropy import table
+from astropy.time import Time
+import astropy.units as u
+import astropy.constants as const
 from orbitize.read_input import read_file
+from copy import deepcopy
 
 
 class System(object):
@@ -67,6 +71,8 @@ class System(object):
         gaia=None,
         fitting_basis="Standard",
         use_rebound=False,
+        full_perspective_model=False,
+        light_timing_correction=False,
     ):
         self.num_secondary_bodies = num_secondary_bodies
         self.data_table = data_table
@@ -81,6 +87,12 @@ class System(object):
         self.gaia = gaia
         self.fitting_basis = fitting_basis
         self.use_rebound = use_rebound
+        self.full_perspective_model = fitting_basis == "FullPerspectiveModel"
+        self.light_timing_correction = light_timing_correction
+
+        if self.light_timing_correction and not self.full_perspective_model:
+            raise ValueError("Corrections for light timing variations can only be used with full perspective and "
+                             "proper motion modeling")
 
         self.best_epochs = []
         self.input_table = self.data_table.copy()
@@ -256,7 +268,6 @@ class System(object):
             self.pm_plx_predictor = hipparcos.PMPlx_Motion(
                 self.stellar_astrom_epochs, alpha0, delta0, alphadec0_epoch
             )
-
 
         self.secondary_mass_indx = [
             self.basis.standard_basis_idx[i]
@@ -469,19 +480,41 @@ class System(object):
                     mtots[body_num] = mtot
 
                 # solve Kepler's equation
-                raoff, decoff, vz_i = kepler.calc_orbit(
-                    epochs,
-                    sma,
-                    ecc,
-                    inc,
-                    argp,
-                    lan,
-                    tau,
-                    plx,
-                    mtot,
-                    mass_for_Kamp=m0,
-                    tau_ref_epoch=self.tau_ref_epoch,
-                )
+                if not self.full_perspective_model:
+                    raoff, decoff, vz_i = kepler.calc_orbit(
+                        epochs,
+                        sma,
+                        ecc,
+                        inc,
+                        argp,
+                        lan,
+                        tau,
+                        plx,
+                        mtot,
+                        mass_for_Kamp=m0,
+                        tau_ref_epoch=self.tau_ref_epoch,
+                    )
+                else:
+                    ra_com_i = (params_arr[self.basis.standard_basis_idx['alpha0']] * u.mas).to(u.deg) / np.cos(
+                        np.radians(self.hipparcos_IAD.delta0)) + self.hipparcos_IAD.alpha0
+                    dec_com_i = (params_arr[self.basis.standard_basis_idx['delta0']] * u.mas).to(
+                        u.deg) + self.hipparcos_IAD.delta0
+                    pmra_com_i = params_arr[self.basis.standard_basis_idx['pmra']]
+                    pmdec_com_i = params_arr[self.basis.standard_basis_idx['pmdec']]
+                    plx_com_i = params_arr[self.basis.standard_basis_idx['plx']]
+                    rv_com_i = params_arr[self.basis.standard_basis_idx['ref_rv']]
+                    ref_epoch = self.basis.perspective_ref_epoch
+                    if self.light_timing_correction:
+                        use_epochs = light_timing_epoch_correction(epochs, ra_com_i, dec_com_i, plx_com_i, pmra_com_i,
+                                                                   pmdec_com_i, rv_com_i,
+                                                                   ref_epoch)
+                    else:
+                        use_epochs = deepcopy(epochs)
+
+                    raoff, decoff, vz_i = calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0,
+                                                               self.tau_ref_epoch, epochs, ref_epoch, ra_com_i,
+                                                               dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i,
+                                                               rv_com_i, mass)
 
                 # raoff, decoff, vz are scalers if the length of epochs is 1
                 if len(epochs) == 1:
@@ -866,3 +899,277 @@ def generate_synthetic_data(
     data_table = read_file(data_table)
 
     return data_table, sma
+
+
+def radecz2xyz(ra, dec, parallax, pmra, pmdec, rv):
+    """
+    Converts from ra, dec, z coordinates to x, y, z coordinates. x points in the direction where
+    ra = dec = 0, z is perpendicular to the celestial equator, y is such that it forms a right-handed
+    coordinate system. These values should be instanteneous.
+    Args:
+        ra: RA of the location to convert (deg)
+        dec: Dec of the location to convert (deg)
+        parallax: parallax of the location to convert (mas)
+        pmra: proper motion in the ra direction (mas/yr)
+        pmdec: proper motion in the dec direction (mas/yr)
+        rv: radial velocity (km/s)
+    Returns:
+
+    """
+    my206265 = 180 / np.pi * 60 * 60
+    sec2year = (1*u.yr).to(u.s).value
+    pc2km = (1*u.pc).to(u.km).value
+
+    distance = 1 / np.tan(parallax / 1000 / my206265) / my206265
+
+    # convert RV to pc/year, convert delta RA and delta Dec to radians/year
+
+    dra = pmra / 1000 / my206265 / np.cos(dec * np.pi / 180)
+    ddec = pmdec / 1000 / my206265
+    ddist = rv / pc2km * sec2year
+
+    # convert first epoch to x,y,z and dx,dy,dz
+
+    x = np.cos(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * distance
+    y = np.sin(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * distance
+    z = np.sin(dec * np.pi / 180) * distance
+
+    # Excellent.  Now dx,dy,dz,which are constants
+
+    dx = -1 * np.sin(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * distance * dra - np.cos(ra * np.pi / 180) * np.sin(
+        dec * np.pi / 180) * distance * ddec + np.cos(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * ddist
+
+    dy = 1 * np.cos(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * distance * dra - np.sin(ra * np.pi / 180) * np.sin(
+        dec * np.pi / 180) * distance * ddec + np.sin(ra * np.pi / 180) * np.cos(dec * np.pi / 180) * ddist
+
+    dz = 1 * np.cos(dec * np.pi / 180) * distance * ddec + np.sin(dec * np.pi / 180) * ddist
+
+    return x, y, z, dx, dy, dz
+
+
+def xyz2radecz(x, y, z, dx, dy, dz):
+    """
+    Converts from x, y, z coordinate system to ra, dec, z coordinate system. Convention for
+    cartesian system is described in the function above (radecz2xyz).
+    Args:
+        x: x coordinate to convert (parsec)
+        y: y coordinate to convert (parsec)
+        z: z coordinate to convert (parsec)
+        dx: dx coordinate to convert (parsec/yr)
+        dy: dy coordinate to convert (parsec/yr)
+        dz: dz coordinate to convert (parsec/yr)
+    Returns:
+
+    """
+    my206265 = 180 / np.pi * 60 * 60
+    sec2year = (1*u.yr).to(u.s).value
+    pc2km = (1*u.pc).to(u.km).value
+
+    distance = np.sqrt(x ** 2 + y ** 2 + z ** 2)
+
+    parallax = np.arctan(1 / my206265 / distance) * my206265 * 1000
+
+    ra = ((np.arctan2(y, x) / (np.pi / 180) + 360) % 360)
+    dec = np.arcsin(z / distance) / (np.pi / 180)
+
+    ddist = 1 / np.sqrt(x ** 2 + y ** 2 + z ** 2) * (x * dx + y * dy + z * dz)
+    dra = 1 / (x ** 2 + y ** 2) * (-1 * y * dx + x * dy)
+    ddec = 1 / (distance * np.sqrt(1 - z ** 2 / distance ** 2)) * (-1 * z * ddist / distance + dz)
+
+    pmra = dra * my206265 * 1000 * np.cos(dec * (np.pi / 180))
+    pmdec = ddec * 1000 * my206265
+    rv = ddist * pc2km / sec2year
+
+    return ra, dec, parallax, pmra, pmdec, rv
+
+
+def rotate(ra, dec, xp, yp, zp):
+    """
+    Rotates between the celestial cartesian plane (x points where ra=dec=0, z perpendicular to celestial
+    equator, y made to form right-handed coordinate system) and the orbitize cartesian plane (z points
+    directly toward star system, x points in local RA direction, y points in local Dec direction).
+    Args:
+        ra: RA at the reference epoch (i.e. the epoch when the parameters orbitize is evaluating are true)
+        dec: Dec at the reference epoch
+        xp: x value in the primed (orbitize) coordinate system
+        yp: y value in the primed (orbitize) coordinate system
+        zp: z value in the primed (orbitize) coordinate system
+    Returns:
+        x: x value in the unprimed (celestial) coordinate frame
+        y: y value in the unprimed (celestial) coordinate frame
+        z: z value in the unprimed (celestial) coordinate frame
+
+    """
+    x = -np.sin(ra * np.pi / 180) * xp - np.cos(ra * np.pi / 180) * np.sin(dec * np.pi / 180) * yp + np.cos(
+        ra * np.pi / 180) * np.cos(dec * np.pi / 180) * zp
+    y = np.cos(ra * np.pi / 180) * xp - np.sin(ra * np.pi / 180) * np.sin(dec * np.pi / 180) * yp + np.sin(
+        ra * np.pi / 180) * np.cos(dec * np.pi / 180) * zp
+    z = np.cos(dec * np.pi / 180) * yp + np.sin(dec * np.pi / 180) * zp
+    return x, y, z
+
+
+def transform_motion(epochs, ra_i, dec_i, parallax_i, sys_pmra, sys_pmdec, sys_rv,
+                     orbit_xdotp, orbit_ydotp, orbit_zdotp, orbit_xp, orbit_yp, orbit_zp,
+                     ra_com_i, dec_com_i, ref_epoch,
+                     orbit_xp_ref, orbit_yp_ref, orbit_zp_ref):
+    """
+    Transforms stellar motion, taking into account changing distance and perspective. Rigorous
+    transformation of coordinates for stars with significant proper motion.
+
+    Args:
+        epochs (array): epochs (in MJD) at which to calculate the rigorous transformation of coordinates
+        ra_i (float): initial RA (deg, at ref_epoch) of the body to transform
+        dec_i (float): initial Dec (deg, at ref_epoch) of the body to transform
+        parallax_i (float): initial parallax (mas, at ref_epoch) of the body to transform
+        sys_pmra (float): proper motion in the RA direction (mas/yr) at the ref_epoch for the entire system
+        sys_pmdec (float): proper motion in the Dec direction (mas/yr) at the ref_epoch for the entire system
+        sys_rv (float): RV of the system at ref_epoch (km/s)
+        orbit_xp (array): orbital motion in the primed (orbitize output) x direction
+        orbit_yp (array): orbital motion in the primed (orbitize output) y direction
+        orbit_zp (array): orbital motion in the primed (orbitize output) z direction
+        ra_com_i (float): RA (deg) of the center of mass (where orbitize assumes it is looking) at ref_epoch
+        dec_com_i (float): Dec (deg) of the center of mass (where orbitize assumes it is looking) at ref_epoch
+        ref_epoch (float): epoch (MJD) on which many other values must be true (including orbital parameters)
+        orbit_xp_ref (float): x coordinate of the orbital motion in the primed frame on ref_epoch
+        orbit_yp_ref (float): y coordinate of the orbital motion in the primed frame on ref_epoch
+        orbit_zp_ref (float): z coordinate of the orbital motion in the primed frame on ref_epoch
+    Returns:
+        ra_f (array): final (transformed) RA values at each epoch in epochs (deg)
+        dec_f (array): final (transformed) Dec values at each epoch in epochs (deg)
+        parallax_f (array): final (transformed) parallax values at each epoch in epochs (mas)
+        pmra_f (array): final (transformed) RA proper motion at each epoch in epochs (mas/yr)
+        pmdec_f (array): final (transformed) Dec proper motion at each epoch in epochs (mas/yr)
+        rv_f (array): final (transformed) RV values at each epoch in epochs (km/s)
+    """
+    del_epochs = ((epochs - ref_epoch) * u.day).to(u.yr).value
+    x_i, y_i, z_i, dx_sys, dy_sys, dz_sys = radecz2xyz(ra_i, dec_i, parallax_i, sys_pmra, sys_pmdec, sys_rv)
+    orbit_x, orbit_y, orbit_z = rotate(ra_com_i, dec_com_i, orbit_xp, orbit_yp, orbit_zp)
+    orbit_xdot, orbit_ydot, orbit_zdot = rotate(ra_com_i, dec_com_i, orbit_xdotp, orbit_ydotp, orbit_zdotp)
+    orbit_x_ref, orbit_y_ref, orbit_z_ref = rotate(ra_com_i, dec_com_i, orbit_xp_ref, orbit_yp_ref,
+                                                   orbit_zp_ref)
+    x_f = x_i + (dx_sys * del_epochs) + (orbit_x - orbit_x_ref)
+    y_f = y_i + (dy_sys * del_epochs) + (orbit_y - orbit_y_ref)
+    z_f = z_i + (dz_sys * del_epochs) + (orbit_z - orbit_z_ref)
+
+    dx_f = dx_sys + orbit_xdot
+    dy_f = dy_sys + orbit_ydot
+    dz_f = dz_sys + orbit_zdot
+
+    ra_f, dec_f, parallax_f, pmra_f, pmdec_f, rv_f = xyz2radecz(x_f, y_f, z_f, dx_f, dy_f, dz_f)
+
+    return ra_f, dec_f, parallax_f, pmra_f, pmdec_f, rv_f
+
+
+def light_timing_correction_iteration(epochs1, distances1, distances2):
+    """
+    Calculates the updated epochs at which orbital or proper motion values should be calculated
+    to correct for light timing delays.
+
+    Args:
+        epochs1 (array): epochs at which values have already been calculated (MJD)
+        distances1 (array): distances assumed when calculating values at epochs1 (pc)
+        distances2 (array): new distances calculated from epochs1
+
+    Returns:
+        epochs2 (array): epochs corrected for light travel time between distances1 and distances2
+    """
+    c = 0.00083942887
+    del_d = (distances2 - distances1) * u.pc
+    del_t = del_d / const.c
+    epochs2 = epochs1 + del_t.to(u.day).value
+    return epochs2
+
+
+def light_timing_epoch_correction(epochs, ra_com_i, dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i, rv_com_i,
+                                  ref_epoch):
+    my206265 = 180 / np.pi * 60 * 60
+    d0 = 1 / np.tan(plx_com_i / 1000 / my206265) / my206265
+    ra1, dec1, parallax1, pmra1, pmdec1, rv1 = transform_motion(epochs, ra_com_i, dec_com_i,
+                                                                plx_com_i, pmra_com_i, pmdec_com_i,
+                                                                rv_com_i, 0, 0, 0, 0, 0, 0, ra_com_i,
+                                                                dec_com_i, ref_epoch, 0, 0, 0)
+
+    d1 = 1 / np.tan(parallax1 / 1000 / my206265) / my206265
+
+    corrected_epochs = light_timing_correction_iteration(epochs, d0, d1)
+
+    return corrected_epochs
+
+
+def calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0, tau_ref_epoch, epochs, ref_epoch,
+                         ra_com_i, dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i, rv_com_i, mass):
+
+    raoff, decoff, zoff, radot, decdot, zdot = kepler.calc_orbit(
+        np.append(epochs, ref_epoch), sma, ecc, inc, argp, lan, tau, plx, mtot,
+        mass_for_Kamp=m0, tau_ref_epoch=tau_ref_epoch,
+        return_cartesian=True
+    )
+
+    x_com_i, y_com_i, z_com_i, dx_com_i, dy_com_i, dz_com_i = radecz2xyz(ra_com_i, dec_com_i,
+                                                                         plx_com_i, pmra_com_i,
+                                                                         pmdec_com_i, rv_com_i)
+    n_epochs = len(epochs)
+    n_orbits = len(sma)
+
+    orbit_xp = np.zeros((n_epochs + 1, 2, n_orbits))
+    orbit_yp = np.zeros((n_epochs + 1, 2, n_orbits))
+    orbit_zp = np.zeros((n_epochs + 1, 2, n_orbits))
+    orbit_xdotp = np.zeros((n_epochs + 1, 2, n_orbits))
+    orbit_ydotp = np.zeros((n_epochs + 1, 2, n_orbits))
+    orbit_zdotp = np.zeros((n_epochs + 1, 2, n_orbits))
+
+    orbit_xp[:, 0, :] = np.reshape(raoff, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_yp[:, 0, :] = np.reshape(decoff, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_zp[:, 0, :] = np.reshape(zoff, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_xp[:, 1, :] = np.reshape(raoff, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+    orbit_yp[:, 1, :] = np.reshape(decoff, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+    orbit_zp[:, 1, :] = np.reshape(zoff, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+
+    orbit_xdotp[:, 0, :] = np.reshape(radot, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_ydotp[:, 0, :] = np.reshape(decdot, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_zdotp[:, 0, :] = np.reshape(zdot, (n_epochs + 1, n_orbits)) * -1 * mass / mtot
+    orbit_xdotp[:, 1, :] = np.reshape(radot, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+    orbit_ydotp[:, 1, :] = np.reshape(decdot, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+    orbit_zdotp[:, 1, :] = np.reshape(zdot, (n_epochs + 1, n_orbits)) * (mtot - mass) / mtot
+
+    orbit_x_ref, orbit_y_ref, orbit_z_ref = rotate(ra_com_i, dec_com_i, orbit_xp[-1, 0, 0],
+                                                   orbit_yp[-1, 0, 0], orbit_zp[-1, 0, 0])
+
+    ra_A_i, dec_A_i, plx_A_i, _, _, _ = xyz2radecz(orbit_x_ref + x_com_i, orbit_y_ref + y_com_i,
+                                                   orbit_z_ref + z_com_i, 0, 0, 0)
+
+    ra_A, dec_A, parallax_A, pmra_A, pmdec_A, rv_A = transform_motion(epochs, ra_A_i, dec_A_i,
+                                                                      plx_A_i, pmra_com_i, pmdec_com_i,
+                                                                      rv_com_i,
+                                                                      orbit_xdotp[:-1, 0, 0],
+                                                                      orbit_ydotp[:-1, 0, 0],
+                                                                      orbit_zdotp[:-1, 0, 0],
+                                                                      orbit_xp[:-1, 0, 0], orbit_yp[:-1, 0, 0],
+                                                                      orbit_zp[:-1, 0, 0], ra_com_i,
+                                                                      dec_com_i, ref_epoch,
+                                                                      orbit_xp[-1, 0, 0],
+                                                                      orbit_yp[-1, 0, 0],
+                                                                      orbit_zp[-1, 0, 0])
+
+    orbit_x_ref, orbit_y_ref, orbit_z_ref = rotate(ra_com_i, dec_com_i, orbit_xp[-1, 1, 0],
+                                                   orbit_yp[-1, 1, 0], orbit_zp[-1, 1, 0])
+    ra_B_i, dec_B_i, plx_B_i, _, _, _ = xyz2radecz(orbit_x_ref + x_com_i, orbit_y_ref + y_com_i,
+                                                   orbit_z_ref + z_com_i, 0, 0, 0)
+
+    ra_B, dec_B, parallax_B, pmra_B, pmdec_B, rv_B = transform_motion(epochs, ra_B_i, dec_B_i,
+                                                                      plx_B_i, pmra_com_i, pmdec_com_i,
+                                                                      rv_com_i,
+                                                                      orbit_xdotp[:-1, 1, 0], orbit_ydotp[:-1, 1, 0],
+                                                                      orbit_zdotp[:-1, 1, 0],
+                                                                      orbit_xp[:-1, 1, 0], orbit_yp[:-1, 1, 0],
+                                                                      orbit_zp[:-1, 1, 0], ra_com_i,
+                                                                      dec_com_i, ref_epoch,
+                                                                      orbit_xp[-1, 1, 0],
+                                                                      orbit_yp[-1, 1, 0],
+                                                                      orbit_zp[-1, 1, 0])
+
+    corrected_raoff = ra_B - ra_A
+    corrected_decoff = dec_B - dec_A
+    corrected_vz_i = rv_B
+
+    return corrected_raoff, corrected_decoff, corrected_vz_i

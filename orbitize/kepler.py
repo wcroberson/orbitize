@@ -4,6 +4,7 @@ This module solves for the orbit of the planet given Keplerian parameters.
 import numpy as np
 import astropy.units as u
 import astropy.constants as consts
+from copy import deepcopy
 
 from orbitize import cuda_ext, cext
 
@@ -47,7 +48,7 @@ def tau_to_manom(date, sma, mtot, tau, tau_ref_epoch):
 
 def calc_orbit(
   epochs, sma, ecc, inc, aop, pan, tau, plx, mtot, mass_for_Kamp=None, tau_ref_epoch=58849, tolerance=1e-9, 
-  max_iter=100, use_c=True, use_gpu=False
+  max_iter=100, use_c=True, use_gpu=False, return_keplerian=True
 ):
 
     """
@@ -127,6 +128,28 @@ def calc_orbit(
     raoff = radius * (c2i2*s1 - s2i2*s2) * plx
     deoff = radius * (c2i2*c1 + s2i2*c2) * plx
 
+    if return_keplerian:
+        zoff = np.zeros(raoff.shape)
+        zoff = deepcopy(radius) * (
+                np.cos(aop) * np.sin(inc) * np.sin(tanom) + np.cos(tanom) * np.sin(inc) * np.sin(aop)) * (
+                       1 / (3.6 * 10 ** 3)) * (np.pi / 180)
+        raoff *= (1 / (3.6 * 10 ** 3)) * (np.pi / 180) * (1 / plx)
+        deoff *= (1 / (3.6 * 10 ** 3)) * (np.pi / 180) * (1 / plx)
+        radot = np.zeros(raoff.shape)
+        dedot = np.zeros(raoff.shape)
+        zdot = np.zeros(raoff.shape)
+
+        if not np.isscalar(sma): raise ValueError(
+            "The Cartesian version of Kepler.calc_orbit currently only supports scalar orbital parameters (not arrays)")
+
+        xyz_res = kepler_to_xyz(sma, ecc, inc, aop, pan, tau, mtot, plx, epochs, eanom)
+        # SET RADOT, DEDOT, ZDOT TO THEIR VARIOUS TERMS IN XYZ_RES
+        radot = xyz_res[3]
+        dedot = xyz_res[4]
+        zdot = xyz_res[5]
+
+        return raoff, deoff, zoff, radot, dedot, zdot
+
     # compute the radial velocity (vz) of the body (size: n_orbs x n_dates)
     # first comptue the RV semi-amplitude (size: n_orbs x n_dates)
     Kv = np.sqrt(consts.G / (1.0 - ecc**2)) * (mass_for_Kamp * u.Msun *
@@ -139,6 +162,7 @@ def calc_orbit(
     # Squeeze out extra dimension (useful if n_orbs = 1, does nothing if n_orbs > 1)
     vz = np.squeeze(vz)[()]
     return raoff, deoff, vz
+
 
 def _calc_ecc_anom(manom, ecc, tolerance=1e-9, max_iter=100, use_c=False, use_gpu=False):
     """
@@ -396,3 +420,60 @@ def _CUDA_mikkola_solver(manom, ecc):
     kep_gpu_ctx.mikkola(manom, ecc, eanom)
 
     return eanom
+
+
+def kepler_to_xyz(sma, ecc, inc, aop, pan, tau, mtot, plx, epochs, eanom):
+    if ecc == 0:
+        ecc = 1e-10
+    if inc == 0:
+        inc = 1e-10
+    period = np.sqrt(4 * np.pi ** 2.0 * (sma * u.AU) ** 3 / (consts.G * (mtot * u.Msun)))
+    period = period.to(u.day).value  # Period in days
+    mean_motion = 2 * np.pi / period
+
+    # Magnitude of angular momentum:
+    h = np.sqrt(consts.G * (mtot * u.Msun) * (sma * u.AU) * (1 - ecc ** 2))
+
+    # Position vector in the perifocal system in AU
+    pos_peri_x = (sma * (np.cos(eanom) - ecc))
+    pos_peri_y = (sma * np.sqrt(1 - ecc ** 2) * np.sin(eanom))
+    pos_peri_z = np.zeros(len(pos_peri_x))
+
+    pos = np.stack((pos_peri_x, pos_peri_y, pos_peri_z)).T
+    pos_magnitude = np.linalg.norm(pos, axis=1)
+
+    # Velocity vector in the perifocal system in km/s
+    vel_peri_x = - ((np.sqrt(consts.G * (mtot * u.Msun) * (sma * u.AU)) * np.sin(eanom) / (pos_magnitude * u.AU)).to(
+        u.km / u.s)).value
+    vel_peri_y = ((h * np.cos(eanom) / (pos_magnitude * u.AU)).to(u.km / u.s)).value
+    vel_peri_z = np.zeros(len(vel_peri_x))
+
+    vel = np.stack((vel_peri_x, vel_peri_y, vel_peri_z)).T
+
+    # Transformation matrix to inertial xyz system, component by component
+    pan = pan + np.pi / 2.0
+    T_11 = np.cos(pan) * np.cos(aop) - np.sin(pan) * np.sin(aop) * np.cos(inc)
+    T_12 = - np.cos(pan) * np.sin(aop) - np.sin(pan) * np.cos(aop) * np.cos(inc)
+    T_13 = np.sin(pan) * np.sin(inc)
+
+    T_21 = np.sin(pan) * np.cos(aop) + np.cos(pan) * np.sin(aop) * np.cos(inc)
+    T_22 = - np.sin(pan) * np.sin(aop) + np.cos(pan) * np.cos(aop) * np.cos(inc)
+    T_23 = - np.cos(pan) * np.sin(inc)
+
+    T_31 = np.sin(aop) * np.sin(inc)
+    T_32 = np.cos(aop) * np.sin(inc)
+    T_33 = np.cos(inc)
+
+    # Stack transformation matrices
+    T = np.array([[T_11, T_12, T_13],
+                  [T_21, T_22, T_23],
+                  [T_31, T_32, T_33]])
+
+    # Vectorized position and velocity transformation
+    pos_xyz = np.einsum('ij,nj->ni', T, pos)
+    vel_xyz = np.einsum('ij,nj->ni', T, vel)
+
+    result = np.stack(
+        [-pos_xyz[:, 0], pos_xyz[:, 1], pos_xyz[:, 2], -vel_xyz[:, 0], vel_xyz[:, 1], vel_xyz[:, 2]])
+
+    return np.squeeze(result)

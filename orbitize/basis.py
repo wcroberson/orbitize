@@ -1,5 +1,6 @@
 import numpy as np
 import astropy.units as u, astropy.constants as consts
+from astropy.time import Time
 import warnings
 import abc
 
@@ -429,6 +430,123 @@ class Standard(Basis):
         # Add hippparcos priors if necessary
         if self.hipparcos_IAD is not None:
             self.set_hip_iad_priors(basis_priors, basis_labels)
+
+        # Add rv priors
+        if self.rv and self.fit_secondary_mass:
+            self.set_rv_priors(basis_priors, basis_labels)
+
+        # Add mass priors
+        self.set_default_mass_priors(basis_priors, basis_labels)
+
+        # Define param label dictionary in current basis & standard basis
+        self.param_idx = dict(zip(basis_labels, np.arange(len(basis_labels))))
+        self.standard_basis_idx = dict(zip(basis_labels, np.arange(len(basis_labels))))
+
+        return basis_priors, basis_labels
+
+    def to_standard_basis(self, param_arr):
+        """
+        For standard basis, no conversion needs to be made.
+
+        Args:
+            param_arr (np.array of float): RxM array of fitting parameters in the standard basis,
+                where R is the number of parameters being fit, and M is the number of orbits. If
+                M=1 (for MCMC), this can be a 1d array.
+
+        Returns:
+            np.array of float: ``param_arr`` without any modification
+        """
+        return param_arr
+
+
+class FullPerspectiveModel(Basis):
+    """
+    Standard basis set based upon the 6 standard Keplarian elements: (sma, ecc, inc, aop, pan, tau).
+
+    Args:
+        stellar_or_system_mass (float): mass of the primary star (if fitting for
+            dynamical masses of both components) or total system mass (if
+            fitting using relative astrometry only) [M_sol]
+        mass_err (float): uncertainty on 'stellar_or_system_mass', in M_sol
+        plx (float): mean parallax of the system, in mas
+        plx_err (float): uncertainty on 'plx', in mas
+        num_secondary_bodies (int): number of secondary bodies in the system, should be at least 1
+        fit_secondary_mass (bool): if True, include the dynamical mass of orbitting body as fitted parameter, if False,
+            'stellar_or_system_mass' is taken to be total mass
+        angle_upperlim (float): either pi or 2pi, to restrict the prior range for 'pan' parameter (default: 2pi)
+        hipparcos_IAD (orbitize.HipparcosLogProb object): if not 'None', then add relevant priors to this data (default: None)
+        rv (bool): if True, then there is radial velocity data and assign radial velocity priors, if False, then there
+            is no radial velocity data and radial velocity priors are not assigned (default: False)
+        rv_instruments (np.array): array of unique rv instruments from the originally supplied data (default: None)
+    """
+
+    def __init__(
+        self,
+        stellar_or_system_mass,
+        mass_err,
+        plx,
+        plx_err,
+        num_secondary_bodies,
+        fit_secondary_mass,
+        angle_upperlim=2 * np.pi,
+        hipparcos_IAD=None,
+        rv=False,
+        rv_instruments=None,
+        perspective_ref_epoch=Time(1991.25, format='decimalyear').mjd
+    ):
+
+        super(FullPerspectiveModel, self).__init__(
+            stellar_or_system_mass,
+            mass_err,
+            plx,
+            plx_err,
+            num_secondary_bodies,
+            fit_secondary_mass,
+            angle_upperlim,
+            hipparcos_IAD,
+            rv,
+            rv_instruments,
+        )
+        self.perspective_ref_epoch = perspective_ref_epoch
+
+    def construct_priors(self):
+        """
+        Generates the parameter label array and initializes the corresponding priors for each
+        parameter that's to be sampled. For the standard basis, the parameters common to each
+        companion are: sma, ecc, inc, aop, pan, tau. Parallax, hipparcos (optional), rv (optional),
+        and mass priors are added at the end.
+
+        Returns:
+            tuple:
+
+                list: list of strings (labels) that indicate the names of each parameter to sample
+
+                list: list of orbitize.priors.Prior objects that indicate the prior distribution of each label
+        """
+        base_labels = ["sma", "ecc", "inc", "aop", "pan", "tau"]
+        basis_priors = []
+        basis_labels = []
+
+        # Add the priors common to each companion
+        for body in np.arange(self.num_secondary_bodies):
+            for elem in base_labels:
+                basis_priors.append(self.default_priors[elem])
+                basis_labels.append(elem + str(body + 1))
+
+        # Add parallax prior
+        basis_labels.append("plx")
+        if self.plx_err > 0:
+            basis_priors.append(priors.GaussianPrior(self.plx, self.plx_err))
+        else:
+            basis_priors.append(self.plx)
+
+        if self.hipparcos_IAD is not None and self.perspective_ref_epoch != Time(1991.25, format='decimalyear').mjd:
+            raise ValueError("If Hipparcos IAD are being used, reference epochs for perspective effects must be the "
+                             "Hipparcos IAD reference epoch.")
+
+        self.set_hip_iad_priors(basis_priors, basis_labels)
+        basis_labels.append("ref_rv")
+        basis_priors.append(priors.UnifromPrior(-100, 100))
 
         # Add rv priors
         if self.rv and self.fit_secondary_mass:
