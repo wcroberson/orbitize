@@ -48,7 +48,7 @@ def tau_to_manom(date, sma, mtot, tau, tau_ref_epoch):
 
 def calc_orbit(
   epochs, sma, ecc, inc, aop, pan, tau, plx, mtot, mass_for_Kamp=None, tau_ref_epoch=58849, tolerance=1e-9, 
-  max_iter=100, use_c=True, use_gpu=False, return_keplerian=True
+  max_iter=100, use_c=True, use_gpu=False, return_cartesian=True
 ):
 
     """
@@ -128,7 +128,7 @@ def calc_orbit(
     raoff = radius * (c2i2*s1 - s2i2*s2) * plx
     deoff = radius * (c2i2*c1 + s2i2*c2) * plx
 
-    if return_keplerian:
+    if return_cartesian:
         zoff = np.zeros(raoff.shape)
         zoff = deepcopy(radius) * (
                 np.cos(aop) * np.sin(inc) * np.sin(tanom) + np.cos(tanom) * np.sin(inc) * np.sin(aop)) * (

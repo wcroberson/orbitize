@@ -71,7 +71,6 @@ class System(object):
         gaia=None,
         fitting_basis="Standard",
         use_rebound=False,
-        full_perspective_model=False,
         light_timing_correction=False,
     ):
         self.num_secondary_bodies = num_secondary_bodies
@@ -495,15 +494,21 @@ class System(object):
                         tau_ref_epoch=self.tau_ref_epoch,
                     )
                 else:
-                    ra_com_i = (params_arr[self.basis.standard_basis_idx['alpha0']] * u.mas).to(u.deg) / np.cos(
-                        np.radians(self.hipparcos_IAD.delta0)) + self.hipparcos_IAD.alpha0
-                    dec_com_i = (params_arr[self.basis.standard_basis_idx['delta0']] * u.mas).to(
-                        u.deg) + self.hipparcos_IAD.delta0
+                    if self.hipparcos_IAD is not None:
+                        ra_com_i = (params_arr[self.basis.standard_basis_idx['alpha0']] * u.mas).to(u.deg) / np.cos(
+                            np.radians(self.hipparcos_IAD.delta0)) + self.hipparcos_IAD.alpha0
+                        dec_com_i = (params_arr[self.basis.standard_basis_idx['delta0']] * u.mas).to(
+                            u.deg) + self.hipparcos_IAD.delta0
+                    else:
+                        ra_com_i = params_arr[self.basis.standard_basis_idx['alpha0']]
+                        dec_com_i = params_arr[self.basis.standard_basis_idx['delta0']]
+                    print(ra_com_i)
                     pmra_com_i = params_arr[self.basis.standard_basis_idx['pmra']]
                     pmdec_com_i = params_arr[self.basis.standard_basis_idx['pmdec']]
                     plx_com_i = params_arr[self.basis.standard_basis_idx['plx']]
                     rv_com_i = params_arr[self.basis.standard_basis_idx['ref_rv']]
                     ref_epoch = self.basis.perspective_ref_epoch
+                    print(ref_epoch)
                     if self.light_timing_correction:
                         use_epochs = light_timing_epoch_correction(epochs, ra_com_i, dec_com_i, plx_com_i, pmra_com_i,
                                                                    pmdec_com_i, rv_com_i,
@@ -512,9 +517,9 @@ class System(object):
                         use_epochs = deepcopy(epochs)
 
                     raoff, decoff, vz_i = calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0,
-                                                               self.tau_ref_epoch, epochs, ref_epoch, ra_com_i,
+                                                               self.tau_ref_epoch, use_epochs, ref_epoch, ra_com_i,
                                                                dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i,
-                                                               rv_com_i, mass)
+                                                               rv_com_i, mass, n_orbits)
 
                 # raoff, decoff, vz are scalers if the length of epochs is 1
                 if len(epochs) == 1:
@@ -539,7 +544,7 @@ class System(object):
             # We are superimposing the Keplerian orbits, so we can add it linearly, scaled by the mass.
             # Because we are in Jacobi coordinates, for companions, we only should model the effect of planets interior to it.
             # (Jacobi coordinates mean that separation for a given companion is measured relative to the barycenter of all interior companions)
-            if self.track_planet_perturbs:
+            if self.track_planet_perturbs and not self.full_perspective_model:
                 for body_num in np.arange(self.num_secondary_bodies + 1):
                     if body_num > 0:
                         # for companions, only perturb companion orbits at larger SMAs than this one.
@@ -1097,7 +1102,7 @@ def light_timing_epoch_correction(epochs, ra_com_i, dec_com_i, plx_com_i, pmra_c
 
 
 def calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0, tau_ref_epoch, epochs, ref_epoch,
-                         ra_com_i, dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i, rv_com_i, mass):
+                         ra_com_i, dec_com_i, plx_com_i, pmra_com_i, pmdec_com_i, rv_com_i, mass, n_orbits):
 
     raoff, decoff, zoff, radot, decdot, zdot = kepler.calc_orbit(
         np.append(epochs, ref_epoch), sma, ecc, inc, argp, lan, tau, plx, mtot,
@@ -1109,7 +1114,6 @@ def calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0, tau_ref_e
                                                                          plx_com_i, pmra_com_i,
                                                                          pmdec_com_i, rv_com_i)
     n_epochs = len(epochs)
-    n_orbits = len(sma)
 
     orbit_xp = np.zeros((n_epochs + 1, 2, n_orbits))
     orbit_yp = np.zeros((n_epochs + 1, 2, n_orbits))
@@ -1168,7 +1172,7 @@ def calc_corrected_orbit(sma, ecc, inc, argp, lan, tau, plx, mtot, m0, tau_ref_e
                                                                       orbit_yp[-1, 1, 0],
                                                                       orbit_zp[-1, 1, 0])
 
-    corrected_raoff = ra_B - ra_A
+    corrected_raoff = (ra_B - ra_A) * np.cos(np.radians(dec_A))
     corrected_decoff = dec_B - dec_A
     corrected_vz_i = rv_B
 

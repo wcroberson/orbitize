@@ -492,7 +492,7 @@ class FullPerspectiveModel(Basis):
         hipparcos_IAD=None,
         rv=False,
         rv_instruments=None,
-        perspective_ref_epoch=Time(1991.25, format='decimalyear').mjd
+        perspective_ref_epoch=Time(2019.5, format='jyear').mjd
     ):
 
         super(FullPerspectiveModel, self).__init__(
@@ -540,13 +540,24 @@ class FullPerspectiveModel(Basis):
         else:
             basis_priors.append(self.plx)
 
-        if self.hipparcos_IAD is not None and self.perspective_ref_epoch != Time(1991.25, format='decimalyear').mjd:
-            raise ValueError("If Hipparcos IAD are being used, reference epochs for perspective effects must be the "
-                             "Hipparcos IAD reference epoch.")
+        if self.hipparcos_IAD is not None:
+            if self.perspective_ref_epoch != Time(1991.25, format='decimalyear').mjd:
+                raise ValueError(
+                    "If Hipparcos IAD are being used, reference epochs for perspective effects must be the "
+                    "Hipparcos IAD reference epoch.")
 
-        self.set_hip_iad_priors(basis_priors, basis_labels)
+            self.set_hip_iad_priors(basis_priors, basis_labels)
+        else:
+            basis_labels.append('alpha0')
+            basis_priors.append(priors.UniformPrior(0, 360))
+            basis_labels.append('delta0')
+            basis_priors.append(priors.UniformPrior(0, 360))
+            basis_labels.append('pmra')
+            basis_priors.append(priors.UniformPrior(-100, 100))
+            basis_labels.append('pmdec')
+            basis_priors.append(priors.UniformPrior(-100, 100))
         basis_labels.append("ref_rv")
-        basis_priors.append(priors.UnifromPrior(-100, 100))
+        basis_priors.append(priors.UniformPrior(-100, 100))
 
         # Add rv priors
         if self.rv and self.fit_secondary_mass:
